@@ -34,9 +34,9 @@ const originUrl = "https://your-origin.com" + url.pathname;
 5. 部署生效
 
 ### 3. 路径规则
-- 访问 `https://your-worker.your-subdomain.workers.dev/`
+- 访问 `https://xxx.pages.dev/`
   → 自动返回 R2 中的 `index.html`
-- 访问 `https://your-worker.your-subdomain.workers.dev/images/logo.png`
+- 访问 `https://xxx.pages.dev/images/logo.png`
   → 读取 R2 中的 `images/logo.png`
 
 ## 工作流程
