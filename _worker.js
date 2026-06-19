@@ -22,7 +22,7 @@ export default {
     if (!object) {
       try {
         // ====================== 在这里填你的源站 ======================
-        const originUrl = "https://majo.cn-nb1.rains3.com" + url.pathname;
+        const originUrl = "http://majo.liuyue.net" + url.pathname;
         // ==============================================================
 
         const originResponse = await fetch(originUrl);
