@@ -41,6 +41,7 @@ export default {
         const removeList = [
           "X-Bitiful-Server-Time",
           "X-Bitiful-Ts-Dt",
+          "X-Bitiful-Force-Attachment",
           "X-Amz-Request-Id",
           "X-Amz-Meta-Checksum-Sha256",
           "X-Amz-Meta-S3b-Last-Modified",
@@ -69,6 +70,7 @@ export default {
     const removeList = [
       "X-Bitiful-Server-Time",
       "X-Bitiful-Ts-Dt",
+      "X-Bitiful-Force-Attachment",
       "X-Amz-Request-Id",
       "X-Amz-Meta-Checksum-Sha256",
       "X-Amz-Meta-S3b-Last-Modified"
