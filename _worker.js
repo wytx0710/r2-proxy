@@ -65,7 +65,7 @@ export default {
     object.writeHttpMetadata(headers);
     headers.set("etag", object.httpEtag);
 
-    // 兜底：再次清理头部（兼容R2存量旧文件）
+    // 再次清理头部（兼容R2存量旧文件）
     const removeList = [
       "X-Bitiful-Server-Time",
       "X-Bitiful-Ts-Dt",
@@ -94,9 +94,7 @@ export default {
       headers.set(k, v);
     }
 
-    // 安全响应头，对齐APISIX/EO/ESA标准
-    headers.set("X-Content-Type-Options", "nosniff");
-    headers.set("X-XSS-Protection", "1; mode=block");
+    // ========= 删除了 X-Content-Type-Options、X-Xss-Protection 两行 =========
 
     // 如需强制HTTPS，取消下方注释
     // headers.set("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
