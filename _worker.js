@@ -36,7 +36,7 @@ export default {
         if (!originResponse.ok) throw new Error("源站资源不存在");
 
         const arrayBuffer = await originResponse.arrayBuffer();
-        // ========== 入库前清洗上游缤纷云脏头部【永久根治关键】 ==========
+        // ========== 入库前清洗上游缤纷云头部==========
         const cleanMetaHeaders = new Headers(originResponse.headers);
         const removeList = [
           "X-Bitiful-Server-Time",
