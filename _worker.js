@@ -31,7 +31,7 @@ export default {
     // R2不存在文件 → 镜像回源缤纷云，写入R2（入库前清洗Header）
     if (!object) {
       try {
-        const originUrl = "https://elaina.cn-nb1.rains3.com" + url.pathname;
+        const originUrl = "https://majo.s3.bitiful.net" + url.pathname;
         const originResponse = await fetch(originUrl);
         if (!originResponse.ok) throw new Error("源站资源不存在");
 
