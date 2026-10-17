@@ -11,7 +11,7 @@
 - ✅ **R2 存储优先**：优先从 Cloudflare R2 对象存储读取资源，保护源站不暴露
 - ✅ **智能镜像回源**：R2 无资源时，自动从对象存储拉取并**永久存入 R2** 持久化
 - ✅ **SigV4 签名鉴权**：原生实现 AWS Signature V4，源站私有读也能直连取数，密钥走环境变量
-- ✅ **MIME 兜底推断**：31 个后缀的 MIME 映射，修正对象存储把 `.js`/`.css` 返回成 octet-stream 的问题
+- ✅ **MIME 按后缀推断**：入库不携带源站元数据，响应时按 31 个后缀映射推断类型，避免 octet-stream 导致预览失效
 - ✅ **自动缓存写入**：资源响应后异步写入边缘缓存，后续访问不再重复回源
 - ✅ **预览 / 下载分流**：图片音视频等走 `inline` 预览，压缩包保持下载行为
 - ✅ **标准缓存头优化**：同时优化浏览器本地缓存 + CDN 边缘缓存双重策略
@@ -94,7 +94,7 @@
 ---
 
 ## 🔁 请求处理工作流程
-1. 接收用户请求 → 校验请求方法，仅放行 GET
+1. 接收用户请求 → 校验请求方法，仅放行 GET/HEAD
 2. 优先查询 **Cloudflare 边缘缓存**，命中直接返回
 3. 未命中缓存 → 从 **R2 Bucket** 读取资源
 4. R2 无资源 → 从**对象存储（SigV4 签名鉴权）下载** → 自动存入 R2 永久保存
@@ -107,13 +107,13 @@
 ```http
 Cache-Control: public, max-age=86400, s-maxage=604800
 ETag: 自动从 R2 获取
-Content-Type: 按后缀兜底推断（避免对象存储返回 octet-stream）
+Content-Type: 按文件后缀推断（不采纳源站类型）
 Content-Disposition: 预览类后缀 inline，压缩包类不设置
 Access-Control-Allow-Origin: *
 ```
 - `max-age=86400`：浏览器本地缓存 1 天
 - `s-maxage=604800`：Cloudflare CDN 边缘缓存 7 天
-- **Content-Type 兜底**：对象存储常把 `.js`/`.css`/字体返回成 `application/octet-stream`，导致本该预览的文件变成下载。代码内置 31 个后缀的 MIME 映射，入库时与响应时各纠正一次（响应侧那次用于兼容 R2 中的存量对象）。
+- **Content-Type 按后缀推断**：对象入库时**不携带任何源站元数据**，响应阶段统一按文件后缀推断类型。这样既避免了对象存储把 `.js`/`.css`/字体返回成 `application/octet-stream` 导致预览失效，也避免了源站的 `Content-Disposition: attachment` 被持久化后覆盖下载/预览判断。内置 31 个后缀的 MIME 映射，识别不出的后缀才回落到 `application/octet-stream`。
 - **预览 / 下载分流**：图片、音视频、文本、样式脚本走 `inline` 直接预览；`zip`/`rar`/`7z` 等压缩包不设该头，保持浏览器默认下载行为。
 
 ---

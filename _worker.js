@@ -62,7 +62,7 @@ export default {
     // 尝试读取 R2
     let object = await env.R2_BUCKET.get(key);
 
-    // R2 不存在 → 从 S3 兼容对象存储拉取，写入 R2（入库前清洗 Header）
+    // R2 不存在 → 从 S3 兼容对象存储拉取，写入 R2（不携带源站元数据）
     if (!object) {
       try {
         const originResponse = await fetchFromS3(env, key);
@@ -292,23 +292,13 @@ async function fetchFromS3(env, key) {
 /** 资源未参与签名内容的 SHA256 占位符（GET 请求体为空） */
 const UNSIGNED_PAYLOAD = "UNSIGNED-PAYLOAD";
 
-/** 将源站响应清洗 Header 后写入 R2，并重新读取返回对象 */
+/** 将源站响应写入 R2，不携带任何上游元数据，并重新读取返回对象 */
 async function mirrorToR2(env, key, originResponse) {
   const arrayBuffer = await originResponse.arrayBuffer();
 
-  // 入库前只保留内容类型，丢弃其余上游元数据
-  const contentType = resolveContentType(
-    key,
-    originResponse.headers.get("Content-Type")
-  );
-
-  const cleanMetaHeaders = new Headers();
-  // 强制丢弃上游的下载标记：源站可能带 Content-Disposition: attachment，
-  // 若持久化进 R2 会覆盖掉按后缀判断的 inline/下载逻辑
-  cleanMetaHeaders.set("Content-Type", contentType);
-
-  // 写入 R2，使用清洗后的元数据
-  await env.R2_BUCKET.put(key, arrayBuffer, { httpMetadata: cleanMetaHeaders });
+  // 不写入任何上游元数据：源站的 Content-Disposition、Content-Type 均不采纳，
+  // 类型统一由响应侧 resolveContentType() 按后缀推断
+  await env.R2_BUCKET.put(key, arrayBuffer);
 
   // 重新读取存入后的对象
   return await env.R2_BUCKET.get(key);
@@ -318,7 +308,7 @@ async function mirrorToR2(env, key, originResponse) {
 async function notFoundResponse(env) {
   let object = await env.R2_BUCKET.get("404.html").catch(() => null);
 
-  // R2 里没有 404.html → 从对象存储镜像一份（复用清洗逻辑）
+  // R2 里没有 404.html → 从对象存储镜像一份
   if (!object) {
     try {
       const originResponse = await fetchFromS3(env, "404.html");
