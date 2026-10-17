@@ -69,7 +69,7 @@
 
 | 变量名 | 必填 | 说明 | 示例 |
 |---|---|---|---|
-| `S3_ENDPOINT` | ✅ | S3 兼容端点地址，末尾不带斜杠 | `https://majo.s3.bitiful.net` |
+| `S3_ENDPOINT` | ✅ | S3 兼容端点地址，末尾不带斜杠 | `https://s3.example.com` |
 | `S3_BUCKET` | ✅ | 源对象存储桶名 | `my-assets` |
 | `S3_ACCESS_KEY_ID` | ✅ | 访问密钥 ID | `AKIAxxxxxx` |
 | `S3_SECRET_ACCESS_KEY` | ✅ | 访问密钥（**只读权限即可**） | `xxxxxx` |
