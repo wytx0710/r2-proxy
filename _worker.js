@@ -12,7 +12,7 @@
  *   S3_SECRET_ACCESS_KEY 访问密钥（只读权限即可）
  *
  * 可选环境变量：
- *   S3_PATH_STYLE      "path" 时用路径风格（默认 path，兼容绝大多数自建/MinIO）
+ *   S3_PATH_STYLE      "path"（默认，兼容自建/MinIO）/ "virtual"（bucket 走子域名）
  *   S3_FETCH_TIMEOUT   回源超时毫秒数，默认 15000
  *
  * 绑定变量：
@@ -25,13 +25,13 @@ export default {
 
     // 处理 OPTIONS 跨域预检请求
     if (request.method === "OPTIONS") {
-      return new Response(null, { status: 204, headers: getCorsHeaders() });
+      return new Response(null, { status: 204, headers: corsHeaders() });
     }
 
     // 仅允许 GET/HEAD 请求
     const isHead = request.method === "HEAD";
     if (request.method !== "GET" && !isHead) {
-      const res = new Response("Method Not Allowed", { status: 405, headers: getCorsHeaders() });
+      const res = new Response("Method Not Allowed", { status: 405, headers: corsHeaders() });
       res.headers.set("Allow", "GET, HEAD, OPTIONS");
       return res;
     }
@@ -56,7 +56,7 @@ export default {
 
     // 阻断路径穿越（../ 之类），非法路径直接 400
     if (!isSafeKey(key)) {
-      return new Response("Bad Request", { status: 400, headers: getCorsHeaders() });
+      return new Response("Bad Request", { status: 400, headers: corsHeaders() });
     }
 
     // 尝试读取 R2
@@ -87,14 +87,16 @@ export default {
     // ========== 根据后缀区分 inline 预览 / 默认下载 ==========
     const ext = key.split(".").pop()?.toLowerCase();
     if (PREVIEW_EXTS.includes(ext)) {
-      headers.set("Content-Disposition", "inline");
+      // 带上 RFC 5987 编码的文件名，中文名下载时不会乱码或丢失
+      headers.set(
+        "Content-Disposition",
+        `inline; filename*=UTF-8''${encodeURIComponent(key.split("/").pop())}`
+      );
     }
     // zip/rar/7z/gz/tar 等压缩包：不设置该头，浏览器保持下载行为
 
     // 注入 CORS 跨域头
-    for (const [k, v] of getCorsHeaders()) {
-      headers.set(k, v);
-    }
+    applyCors(headers);
 
     // HEAD 只返回头部不占用 body，且不写边缘缓存（避免无 body 响应污染 GET 缓存）
     const response = new Response(isHead ? null : object.body, { headers });
@@ -106,15 +108,29 @@ export default {
   },
 };
 
-/** 复用 CORS 配置，GET 和 OPTIONS 共用 */
-function getCorsHeaders() {
-  return new Headers({
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "*",
-    "Access-Control-Allow-Headers": "*",
-    "Access-Control-Expose-Headers": "*",
-    "Access-Control-Max-Age": "3600",
-  });
+/**
+ * CORS 响应头，模块级常量。
+ * 每次请求都 new 一个 Headers 纯属浪费，这里建一次复用。
+ */
+const CORS_HEADERS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "*",
+  "Access-Control-Allow-Headers": "*",
+  "Access-Control-Expose-Headers": "*",
+  "Access-Control-Max-Age": "3600",
+};
+
+/** 把预设的 CORS 头逐条拷入目标 Headers */
+function applyCors(headers) {
+  for (const [k, v] of Object.entries(CORS_HEADERS)) {
+    headers.set(k, v);
+  }
+  return headers;
+}
+
+/** 直接生成一份可用的 CORS Headers 实例 */
+function corsHeaders() {
+  return new Headers(CORS_HEADERS);
 }
 
 /** inline 预览后缀白名单；压缩包类不在其中，浏览器保持下载 */
@@ -125,9 +141,16 @@ const PREVIEW_EXTS = [
 ];
 
 /**
- * 兜底 MIME 映射。
- * 对象存储对 .js/.css/字体等常返回 application/octet-stream，
- * 会导致浏览器把本该 inline 预览的文件变成下载，这里按后缀纠正。
+ * 空字符串的 SHA256 十六进制值。
+ * GET 请求体恒为空，签名时用真实哈希而非 UNSIGNED-PAYLOAD 占位符，
+ * 可兼容会严格校验 x-amz-content-sha256 的 S3 实现。
+ */
+const EMPTY_BODY_SHA256 =
+  "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+/**
+ * 后缀 → MIME 映射。
+ * 对象入库时不携带源站元数据，类型一律在响应阶段按后缀推断。
  */
 const MIME_FALLBACK = {
   html: "text/html; charset=utf-8",
@@ -188,8 +211,13 @@ function isSafeKey(key) {
   return !key.split("/").some((seg) => seg === "");
 }
 
-/** 读取对象存储配置，缺失时抛出可读错误 */
+/** 解析后的配置缓存：同一 isolate 生命周期内环境变量不变 */
+let s3ConfigCache = null;
+
+/** 读取对象存储配置，缺失时抛出可读错误；结果缓存复用 */
 function getS3Config(env) {
+  if (s3ConfigCache) return s3ConfigCache;
+
   const { S3_ENDPOINT, S3_REGION, S3_BUCKET, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY } = env;
   const missing = [];
   if (!S3_ENDPOINT) missing.push("S3_ENDPOINT");
@@ -199,9 +227,9 @@ function getS3Config(env) {
   if (missing.length) {
     throw new Error("缺少环境变量: " + missing.join(", "));
   }
-  return {
+  s3ConfigCache = {
     endpoint: S3_ENDPOINT.replace(/\/+$/, ""),
-    // 多数厂商会校验 region，缺失时用阿里云默认值兜底
+    // 多数厂商会校验 region，缺失时用默认值兜底
     region: S3_REGION || "us-east-1",
     bucket: S3_BUCKET,
     accessKeyId: S3_ACCESS_KEY_ID,
@@ -209,14 +237,25 @@ function getS3Config(env) {
     pathStyle: (env.S3_PATH_STYLE || "path") !== "virtual",
     timeout: Number(env.S3_FETCH_TIMEOUT) || 15000,
   };
+  return s3ConfigCache;
 }
 
-/** 构造对象在存储中的完整 URL（path 风格默认，兼容性最好） */
+/**
+ * 构造对象在存储中的完整 URL。
+ * path 风格：https://endpoint/bucket/key —— 自建存储、MinIO、缤纷云默认走这个
+ * virtual 风格：https://bucket.endpoint/key —— AWS S3 等云厂商使用
+ */
 function buildObjectUrl(cfg, key) {
   const encodedKey = key.split("/").map(encodeURIComponent).join("/");
-  return cfg.pathStyle
-    ? `${cfg.endpoint}/${encodeURIComponent(cfg.bucket)}/${encodedKey}`
-    : `${cfg.endpoint}/${encodedKey}`;
+
+  if (cfg.pathStyle) {
+    return `${cfg.endpoint}/${encodeURIComponent(cfg.bucket)}/${encodedKey}`;
+  }
+
+  // virtual 风格需把 bucket 提到子域名：bucket.endpoint
+  const u = new URL(cfg.endpoint);
+  u.hostname = `${encodeURIComponent(cfg.bucket)}.${u.hostname}`;
+  return `${u.origin}/${encodedKey}`;
 }
 
 /**
@@ -235,10 +274,10 @@ async function fetchFromS3(env, key) {
   const canonicalUri = u.pathname;
   const canonicalQuery = u.searchParams.size === 0 ? "" : "?" + u.searchParams.toString();
 
-  // 需要参与签名的头（host + x-amz-* + x-amz-content-sha256）
+  // 需要参与签名的头（host + x-amz-*）
   const headersToSign = {
     host: u.host,
-    "x-amz-content-sha256": UNSIGNED_PAYLOAD,
+    "x-amz-content-sha256": EMPTY_BODY_SHA256,
     "x-amz-date": amzDate,
   };
 
@@ -253,7 +292,7 @@ async function fetchFromS3(env, key) {
     canonicalQuery,
     canonicalHeaders,
     signedHeaders,
-    UNSIGNED_PAYLOAD,
+    EMPTY_BODY_SHA256,
   ].join("\n");
 
   const credentialScope = `${dateStamp}/${cfg.region}/s3/aws4_request`;
@@ -289,19 +328,30 @@ async function fetchFromS3(env, key) {
   return res;
 }
 
-/** 资源未参与签名内容的 SHA256 占位符（GET 请求体为空） */
-const UNSIGNED_PAYLOAD = "UNSIGNED-PAYLOAD";
-
-/** 将源站响应写入 R2，不携带任何上游元数据，并重新读取返回对象 */
+/**
+ * 将源站响应流式写入 R2，不携带任何上游元数据。
+ *
+ * 直接透传 ReadableStream 而非 arrayBuffer，避免大文件撑爆 Worker 内存。
+ * 用 tee() 分流：一份写入 R2，一份直接回给用户，无需把整个文件读进内存，
+ * 也省去写入后再 get 一次的往返。
+ *
+ * 返回可直接用于响应的对象句柄，结构对齐 R2Object。
+ */
 async function mirrorToR2(env, key, originResponse) {
-  const arrayBuffer = await originResponse.arrayBuffer();
+  // tee 出两条独立分支，两边可同时消费
+  const [toR2, toClient] = originResponse.body.tee();
 
   // 不写入任何上游元数据：源站的 Content-Disposition、Content-Type 均不采纳，
   // 类型统一由响应侧 resolveContentType() 按后缀推断
-  await env.R2_BUCKET.put(key, arrayBuffer);
+  const result = await env.R2_BUCKET.put(key, toR2);
 
-  // 重新读取存入后的对象
-  return await env.R2_BUCKET.get(key);
+  // 最小 R2Object 替身，供上层统一走 writeHttpMetadata + body 的读取路径。
+  // 元数据为空，writeHttpMetadata 不写入任何头，类型由后缀推断决定。
+  return {
+    body: toClient,
+    httpEtag: result.httpEtag,
+    writeHttpMetadata() {},
+  };
 }
 
 /** 404 兜底页：读取 R2 中的 404.html（无则从对象存储拉一次），以 404 状态码返回其内容 */
@@ -315,7 +365,7 @@ async function notFoundResponse(env) {
       object = await mirrorToR2(env, "404.html", originResponse);
     } catch (err) {
       // 彻底没有 → 返回纯文本兜底
-      return new Response("Not Found", { status: 404, headers: getCorsHeaders() });
+      return new Response("Not Found", { status: 404, headers: corsHeaders() });
     }
   }
 
@@ -325,9 +375,7 @@ async function notFoundResponse(env) {
   headers.set("Content-Type", "text/html; charset=utf-8");
   headers.set("Content-Disposition", "inline");
   headers.set("Cache-Control", "no-store"); // 404 不进缓存
-  for (const [k, v] of getCorsHeaders()) {
-    headers.set(k, v);
-  }
+  applyCors(headers);
 
   return new Response(object.body, { status: 404, headers });
 }

@@ -11,6 +11,8 @@
 - ✅ **R2 存储优先**：优先从 Cloudflare R2 对象存储读取资源，保护源站不暴露
 - ✅ **智能镜像回源**：R2 无资源时，自动从对象存储拉取并**永久存入 R2** 持久化
 - ✅ **SigV4 签名鉴权**：原生实现 AWS Signature V4，源站私有读也能直连取数，密钥走环境变量
+- ✅ **流式回源入库**：`tee()` 分流后直传R2，不把整个文件读进 Worker 内存，大文件安全
+- ✅ **中文文件名正确下载**：`Content-Disposition` 带 RFC 5987 编码，预览与下载都不乱码
 - ✅ **MIME 按后缀推断**：入库不携带源站元数据，响应时按 31 个后缀映射推断类型，避免 octet-stream 导致预览失效
 - ✅ **自动缓存写入**：资源响应后异步写入边缘缓存，后续访问不再重复回源
 - ✅ **预览 / 下载分流**：图片音视频等走 `inline` 预览，压缩包保持下载行为
@@ -74,7 +76,7 @@
 | `S3_ACCESS_KEY_ID` | ✅ | 访问密钥 ID | `AKIAxxxxxx` |
 | `S3_SECRET_ACCESS_KEY` | ✅ | 访问密钥（**只读权限即可**） | `xxxxxx` |
 | `S3_REGION` | ❌ | 区域标识，缺省按 `us-east-1` | `ap-guangzhou` |
-| `S3_PATH_STYLE` | ❌ | `path`（默认，通用）/ `virtual` | `path` |
+| `S3_PATH_STYLE` | ❌ | URL 风格：`path`（默认，`endpoint/bucket/key`）/ `virtual`（`bucket.endpoint/key`） | `path` |
 | `S3_FETCH_TIMEOUT` | ❌ | 回源超时毫秒，默认 `15000` | `15000` |
 
 > ⚠️ 密钥类变量建议在 Cloudflare 控制台加密存储（Secret），不要提交进 Git 仓库。
@@ -82,6 +84,10 @@
 **对象存储密钥所需权限**：只需 `s3:GetObject`（读单个对象）。若还希望 Worker 能拉取 `404.html`，该对象也要可读。
 
 **为什么改用签名直连**：源站若为私有读，直接拼接公开 URL 会返回 403。启用 SigV4 签名后，无论源站是公开读还是私有读都能正常取数。
+
+**签名兼容性**：`x-amz-content-sha256` 使用空请求体的真实 SHA256 值，而非 `UNSIGNED-PAYLOAD` 占位符。部分 S3 兼容实现（MinIO 老版本、OSS 兼容层）会校验并拒绝占位符，用真实哈希可兼容所有实现。
+
+**大文件处理**：回源响应经 `tee()` 分流，一份写入 R2、一份直接返回用户，全程不将文件读入 Worker 内存（上限 128MB），因此不存在大文件撑爆内存的风险。
 
 ---
 
@@ -108,13 +114,13 @@
 Cache-Control: public, max-age=86400, s-maxage=604800
 ETag: 自动从 R2 获取
 Content-Type: 按文件后缀推断（不采纳源站类型）
-Content-Disposition: 预览类后缀 inline，压缩包类不设置
+Content-Disposition: 预览类后缀inline（带 RFC 5987 文件名），压缩包类不设置
 Access-Control-Allow-Origin: *
 ```
 - `max-age=86400`：浏览器本地缓存 1 天
 - `s-maxage=604800`：Cloudflare CDN 边缘缓存 7 天
 - **Content-Type 按后缀推断**：对象入库时**不携带任何源站元数据**，响应阶段统一按文件后缀推断类型。这样既避免了对象存储把 `.js`/`.css`/字体返回成 `application/octet-stream` 导致预览失效，也避免了源站的 `Content-Disposition: attachment` 被持久化后覆盖下载/预览判断。内置 31 个后缀的 MIME 映射，识别不出的后缀才回落到 `application/octet-stream`。
-- **预览 / 下载分流**：图片、音视频、文本、样式脚本走 `inline` 直接预览；`zip`/`rar`/`7z` 等压缩包不设该头，保持浏览器默认下载行为。
+- **预览 / 下载分流**：图片、音视频、文本、样式脚本走 `inline` 直接预览；`zip`/`rar`/`7z` 等压缩包不设该头，保持浏览器默认下载行为。预览时会附带 `filename*=UTF-8''...`，中文文件名下载不会乱码或丢失。
 
 ---
 
