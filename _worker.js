@@ -5,7 +5,7 @@
  * 对象存储凭据全部来自环境变量，不写死在代码里。
  *
  * 必需环境变量：
- *   S3_ENDPOINT        S3 兼容端点，如 https://majo.s3.bitiful.net
+ *   S3_ENDPOINT        S3 兼容端点地址，末尾不带斜杠
  *   S3_REGION          区域标识，如 ap-guangzhou（部分厂商可填任意值）
  *   S3_BUCKET          桶名
  *   S3_ACCESS_KEY_ID   访问密钥 ID
