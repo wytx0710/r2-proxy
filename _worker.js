@@ -13,7 +13,7 @@
  *
  * 可选环境变量：
  *   S3_PATH_STYLE      "path"（默认，兼容自建/MinIO）/ "virtual"（bucket 走子域名）
- *   S3_FETCH_TIMEOUT   回源超时毫秒数，默认 15000
+ *   S3_FETCH_TIMEOUT   回源超时毫秒数，默认 15000，限制在 1000~60000
  *
  * 绑定变量：
  *   R2_BUCKET          Cloudflare R2 桶绑定
@@ -36,77 +36,185 @@ export default {
       return res;
     }
 
-    // 缓存 key 忽略查询串，避免同一文件因 ?xxx 参数不同造成缓存碎片
-    const cacheKey = new Request(url.origin + url.pathname);
-    const cache = caches.default;
-
-    // 优先读取 Cloudflare 边缘缓存
-    const cachedRes = await cache.match(cacheKey);
-    if (cachedRes) {
-      // HEAD 只返回头部，不带 body
-      return isHead
-        ? new Response(null, { status: cachedRes.status, headers: cachedRes.headers })
-        : cachedRes;
-    }
-
     // 路径映射：访问根路径指向 index.html
     let key = url.pathname === "/" ? "index.html" : url.pathname.slice(1);
     // 解码 URL 转义（中文文件名 / %20 空格等），匹配存储中的真实 key
-    try { key = decodeURIComponent(key); } catch (e) { /* 转义非法则保持原样 */ }
+    try {
+      key = decodeURIComponent(key);
+    } catch (e) {
+      /* 转义非法则保持原样，交给 isSafeKey 兜底 */
+    }
 
     // 阻断路径穿越（../ 之类），非法路径直接 400
     if (!isSafeKey(key)) {
       return new Response("Bad Request", { status: 400, headers: corsHeaders() });
     }
 
-    // 尝试读取 R2
-    let object = await env.R2_BUCKET.get(key);
+    const ifNoneMatch = request.headers.get("if-none-match");
+    const range = parseRange(request.headers.get("range"));
 
-    // R2 不存在 → 从 S3 兼容对象存储拉取，写入 R2（不携带源站元数据）
-    if (!object) {
-      try {
-        const originResponse = await fetchFromS3(env, key);
-        object = await mirrorToR2(env, key, originResponse);
-      } catch (err) {
-        // 拉取失败 → 返回 404.html 页面内容（带 404 状态码）
-        return notFoundResponse(env);
-      }
+    try {
+      if (!env.R2_BUCKET) throw new ConfigError("缺少 R2_BUCKET 存储桶绑定");
+      // HEAD 只取元数据，不下载正文、不写缓存
+      if (isHead) return await handleHead(env, key, ifNoneMatch);
+      return await handleGet(request, env, context, url, key, ifNoneMatch, range);
+    } catch (err) {
+      return errorResponse(err);
     }
-
-    // 组装响应头
-    const headers = new Headers();
-    object.writeHttpMetadata(headers);
-    headers.set("etag", object.httpEtag);
-
-    // 纠正内容类型：兼容 R2 中存量的旧对象（入库时类型不准）
-    headers.set("Content-Type", resolveContentType(key, headers.get("Content-Type")));
-
-    // 统一缓存策略
-    headers.set("Cache-Control", "public, max-age=86400, s-maxage=604800");
-
-    // ========== 根据后缀区分 inline 预览 / 默认下载 ==========
-    const ext = key.split(".").pop()?.toLowerCase();
-    if (PREVIEW_EXTS.includes(ext)) {
-      // 带上 RFC 5987 编码的文件名，中文名下载时不会乱码或丢失
-      headers.set(
-        "Content-Disposition",
-        `inline; filename*=UTF-8''${encodeURIComponent(key.split("/").pop())}`
-      );
-    }
-    // zip/rar/7z/gz/tar 等压缩包：不设置该头，浏览器保持下载行为
-
-    // 注入 CORS 跨域头
-    applyCors(headers);
-
-    // HEAD 只返回头部不占用 body，且不写边缘缓存（避免无 body 响应污染 GET 缓存）
-    const response = new Response(isHead ? null : object.body, { headers });
-    if (!isHead) {
-      context.waitUntil(cache.put(cacheKey, response.clone()));
-    }
-
-    return response;
   },
 };
+
+/**
+ * GET 主流程：边缘缓存 → R2 → 回源 → 回写 R2 / 边缘缓存
+ */
+async function handleGet(request, env, context, url, key, ifNoneMatch, range) {
+  // 缓存 key 忽略查询串，避免同一文件因 ?xxx 参数不同造成缓存碎片
+  const cacheKey = new Request(url.origin + url.pathname);
+  const cache = caches.default;
+
+  // Range 请求不读写边缘缓存：避免 206 切片覆盖完整对象
+  if (!range) {
+    const cachedRes = await cache.match(cacheKey);
+    if (cachedRes) {
+      return isNotModified(cachedRes.headers.get("etag"), ifNoneMatch)
+        ? notModifiedResponse(cachedRes.headers.get("etag"))
+        : cachedRes;
+    }
+  }
+
+  // 优先读取 R2；带 Range 时只取切片，避免为一次拖动下载整个文件
+  let object;
+  try {
+    object = await env.R2_BUCKET.get(key, range ? { range } : undefined);
+  } catch (err) {
+    // 部分 R2 实现对越界区间直接抛错，这里转成 416 而不是 502
+    if (range) {
+      const meta = await env.R2_BUCKET.head(key).catch(() => null);
+      if (meta) return rangeNotSatisfiableResponse(meta.size);
+    }
+    throw err;
+  }
+
+  if (object) {
+    if (range && isRangeUnsatisfiable(range, object)) {
+      return rangeNotSatisfiableResponse(object.size);
+    }
+
+    const headers = buildObjectHeaders(object, key, range);
+    if (!range && isNotModified(object.httpEtag, ifNoneMatch)) {
+      return notModifiedResponse(object.httpEtag);
+    }
+
+    const res = new Response(object.body, { status: range ? 206 : 200, headers });
+    if (!range) {
+      context.waitUntil(cache.put(cacheKey, res.clone()).catch(() => {}));
+    }
+    return res;
+  }
+
+  // R2 无资源 → 从对象存储拉取；Range 原样透传给源站
+  const originRes = await fetchFromS3(env, key, {
+    range: range ? request.headers.get("range") : null,
+  });
+
+  // 源站 404 才回退到 404.html，其余错误由 errorResponse 区分成 502
+  if (originRes.status === 404) return notFoundResponse(env);
+
+  // 源站判定区间越界（416）：透传状态码与 Content-Range，不当作回源故障
+  if (range && originRes.status === 416) {
+    const headers = buildOriginHeaders(originRes, key);
+    if (originRes.body) await originRes.body.cancel().catch(() => {});
+    return new Response(null, { status: 416, headers });
+  }
+
+  if (!originRes.ok) throw new OriginError(originRes.status);
+
+  // 切片内容不入库、不缓存，直接 206 透传
+  if (range) {
+    const body = originRes.body;
+    return new Response(body, {
+      status: originRes.status === 206 ? 206 : 200,
+      headers: buildOriginHeaders(originRes, key),
+    });
+  }
+
+  // 条件请求命中：不必把整个对象写进 R2，直接 304
+  if (isNotModified(originRes.headers.get("etag"), ifNoneMatch)) {
+    if (originRes.body) await originRes.body.cancel().catch(() => {});
+    return notModifiedResponse(originRes.headers.get("etag"));
+  }
+
+  const mirrored = await mirrorToR2(env, key, originRes);
+  const res = new Response(mirrored.body, {
+    headers: buildObjectHeaders(mirrored, key, null),
+  });
+  context.waitUntil(cache.put(cacheKey, res.clone()).catch(() => {}));
+  return res;
+}
+
+/**
+ * HEAD 流程：R2 元数据 → 源站 HEAD。
+ * 不回源 GET、不写 R2，避免"一次 HEAD 触发整文件镜像"。
+ */
+async function handleHead(env, key, ifNoneMatch) {
+  const object = await env.R2_BUCKET.head(key);
+  if (object) {
+    if (isNotModified(object.httpEtag, ifNoneMatch)) {
+      return notModifiedResponse(object.httpEtag);
+    }
+    return new Response(null, { headers: buildObjectHeaders(object, key, null) });
+  }
+
+  const originRes = await fetchFromS3(env, key, { method: "HEAD" });
+  if (originRes.status === 404) {
+    if (originRes.body) await originRes.body.cancel().catch(() => {});
+    const headers = corsHeaders();
+    headers.set("Content-Type", "text/html; charset=utf-8");
+    headers.set("Cache-Control", "no-store");
+    return new Response(null, { status: 404, headers });
+  }
+  if (!originRes.ok) throw new OriginError(originRes.status);
+
+  return new Response(null, { headers: buildOriginHeaders(originRes, key) });
+}
+
+/** 配置缺失（环境变量 / 绑定）时抛出，映射成 500 而不是 404 */
+class ConfigError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "ConfigError";
+  }
+}
+
+/** 源站返回非 2xx（404/416 已单独处理），映射成 502 */
+class OriginError extends Error {
+  constructor(status) {
+    super(`对象存储返回 ${status}`);
+    this.name = "OriginError";
+    this.status = status;
+  }
+}
+
+/**
+ * 统一错误响应：
+ * - 配置问题 → 500，提示运维补变量
+ * - 源站超时 / 403 / 5xx → 502，不再伪装成 404
+ */
+function errorResponse(err) {
+  if (err instanceof ConfigError) {
+    console.error("[r2-proxy] 配置错误:", err.message);
+    return plainResponse(500, "Proxy Configuration Error");
+  }
+  console.error("[r2-proxy] 回源失败:", err && err.message ? err.message : err);
+  return plainResponse(502, "Bad Gateway");
+}
+
+function plainResponse(status, text) {
+  const headers = corsHeaders();
+  headers.set("Content-Type", "text/plain; charset=utf-8");
+  headers.set("Cache-Control", "no-store");
+  return new Response(text, { status, headers });
+}
 
 /**
  * CORS 响应头，模块级常量。
@@ -142,7 +250,7 @@ const PREVIEW_EXTS = [
 
 /**
  * 空字符串的 SHA256 十六进制值。
- * GET 请求体恒为空，签名时用真实哈希而非 UNSIGNED-PAYLOAD 占位符，
+ * GET/HEAD 请求体恒为空，签名时用真实哈希而非 UNSIGNED-PAYLOAD 占位符，
  * 可兼容会严格校验 x-amz-content-sha256 的 S3 实现。
  */
 const EMPTY_BODY_SHA256 =
@@ -211,23 +319,177 @@ function isSafeKey(key) {
   return !key.split("/").some((seg) => seg === "");
 }
 
-/** 解析后的配置缓存：同一 isolate 生命周期内环境变量不变 */
-let s3ConfigCache = null;
+/* ---------------- Range / 条件请求 ---------------- */
 
-/** 读取对象存储配置，缺失时抛出可读错误；结果缓存复用 */
+/**
+ * 解析单段 Range 头，返回 R2 的 range 选项。
+ * 多段 Range（bytes=0-1,5-6）与非法格式一律返回 null → 按完整对象响应。
+ */
+function parseRange(header) {
+  if (!header) return null;
+  const match = /^bytes=(\d*)-(\d*)$/.exec(header.trim());
+  if (!match) return null;
+
+  const [, startRaw, endRaw] = match;
+  if (!startRaw && !endRaw) return null;
+
+  // 后缀形式 bytes=-500：取最后 500 字节
+  if (!startRaw) {
+    const suffix = Number(endRaw);
+    return suffix > 0 ? { suffix } : null;
+  }
+
+  const offset = Number(startRaw);
+  if (!endRaw) return { offset };
+
+  const end = Number(endRaw);
+  if (end < offset) return null;
+  return { offset, length: end - offset + 1 };
+}
+
+/** 判断请求区间是否完全越界（起始位置不小于对象总长） */
+function isRangeUnsatisfiable(range, object) {
+  if (typeof object.size !== "number") return false;
+  const served = object.range;
+  if (served && typeof served.offset === "number") return served.offset >= object.size;
+  if (typeof range.offset === "number") return range.offset >= object.size;
+  return false;
+}
+
+/** 返回 416，并带上对象总长，便于客户端重新计算区间 */
+function rangeNotSatisfiableResponse(size) {
+  const headers = corsHeaders();
+  headers.set("Content-Range", `bytes */${typeof size === "number" ? size : "*"}`);
+  headers.set("Cache-Control", "no-store");
+  return new Response(null, { status: 416, headers });
+}
+
+/** 判定 If-None-Match 是否命中当前 ETag（支持弱比较与 *） */
+function isNotModified(etag, ifNoneMatch) {
+  if (!etag || !ifNoneMatch) return false;
+  const target = etag.replace(/^W\//, "");
+  return ifNoneMatch
+    .split(",")
+    .map((v) => v.trim().replace(/^W\//, ""))
+    .some((v) => v === "*" || v === target);
+}
+
+/** 304 只回 ETag 与缓存策略，不带正文 */
+function notModifiedResponse(etag) {
+  const headers = corsHeaders();
+  if (etag) headers.set("ETag", etag);
+  headers.set("Cache-Control", "public, max-age=86400, s-maxage=604800");
+  return new Response(null, { status: 304, headers });
+}
+
+/* ---------------- 响应头组装 ---------------- */
+
+/**
+ * 由 R2 对象（或镜像替身）生成响应头。
+ * Range 请求下补 Content-Range，完整响应补 Content-Length。
+ */
+function buildObjectHeaders(object, key, range) {
+  const headers = new Headers();
+  if (typeof object.writeHttpMetadata === "function") object.writeHttpMetadata(headers);
+
+  // 元数据不可信：类型按后缀推断，下载/预览头由本服务统一下发
+  headers.delete("Content-Disposition");
+  headers.set("Content-Type", resolveContentType(key, headers.get("Content-Type")));
+  headers.set(
+    "Cache-Control",
+    range ? "public, max-age=86400" : "public, max-age=86400, s-maxage=604800"
+  );
+  headers.set("Accept-Ranges", "bytes");
+  headers.set("X-Content-Type-Options", "nosniff");
+  if (object.httpEtag) headers.set("ETag", object.httpEtag);
+
+  applyContentDisposition(headers, key);
+  applyLengthAndRange(headers, object, range);
+  applyCors(headers);
+  return headers;
+}
+
+/** 源站直出（206 切片透传）时的响应头，仅采信长度与区间信息 */
+function buildOriginHeaders(originRes, key) {
+  const headers = new Headers();
+  headers.set("Content-Type", resolveContentType(key, originRes.headers.get("Content-Type")));
+  headers.set("Cache-Control", "public, max-age=86400");
+  headers.set("Accept-Ranges", "bytes");
+  headers.set("X-Content-Type-Options", "nosniff");
+
+  const length = originRes.headers.get("Content-Length");
+  if (length) headers.set("Content-Length", length);
+  const contentRange = originRes.headers.get("Content-Range");
+  if (contentRange) headers.set("Content-Range", contentRange);
+  const etag = originRes.headers.get("ETag");
+  if (etag) headers.set("ETag", etag);
+
+  applyContentDisposition(headers, key);
+  applyCors(headers);
+  return headers;
+}
+
+/**
+ * 预览类后缀加 inline + RFC 5987 文件名；压缩包等不下发该头，保持下载行为。
+ * 文件名中的 ' ( ) * 必须转义，否则 filename* 解析会截断。
+ */
+function applyContentDisposition(headers, key) {
+  const filename = key.split("/").pop() || "";
+  const ext = filename.split(".").pop()?.toLowerCase() || "";
+  if (!PREVIEW_EXTS.includes(ext)) return;
+
+  const encoded = encodeURIComponent(filename).replace(
+    /['()*]/g,
+    (c) => "%" + c.charCodeAt(0).toString(16).toUpperCase()
+  );
+  headers.set("Content-Disposition", `inline; filename*=UTF-8''${encoded}`);
+}
+
+/** 写入 Content-Length；Range 响应额外写 Content-Range */
+function applyLengthAndRange(headers, object, range) {
+  const fullSize = typeof object.size === "number" ? object.size : null;
+
+  if (!range) {
+    if (fullSize !== null) headers.set("Content-Length", String(fullSize));
+    return;
+  }
+
+  const served = object.range;
+  const start =
+    served && typeof served.offset === "number"
+      ? served.offset
+      : typeof range.offset === "number"
+        ? range.offset
+        : 0;
+
+  let length = served && typeof served.length === "number" ? served.length : null;
+  if (length === null && fullSize !== null) length = fullSize - start;
+  if (length === null && typeof range.length === "number") length = range.length;
+
+  if (length !== null && length >= 0) headers.set("Content-Length", String(length));
+  if (fullSize !== null && length !== null && length > 0) {
+    headers.set("Content-Range", `bytes ${start}-${start + length - 1}/${fullSize}`);
+  }
+}
+
+/* ---------------- 对象存储配置与签名 ---------------- */
+
+/**
+ * 读取对象存储配置。
+ * 不做模块级缓存：读取 env 的开销远小于一次网络往返，
+ * 缓存反而会在变量变更（同 isolate 复用时）留下脏配置。
+ */
 function getS3Config(env) {
-  if (s3ConfigCache) return s3ConfigCache;
-
   const { S3_ENDPOINT, S3_REGION, S3_BUCKET, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY } = env;
+
   const missing = [];
   if (!S3_ENDPOINT) missing.push("S3_ENDPOINT");
   if (!S3_BUCKET) missing.push("S3_BUCKET");
   if (!S3_ACCESS_KEY_ID) missing.push("S3_ACCESS_KEY_ID");
   if (!S3_SECRET_ACCESS_KEY) missing.push("S3_SECRET_ACCESS_KEY");
-  if (missing.length) {
-    throw new Error("缺少环境变量: " + missing.join(", "));
-  }
-  s3ConfigCache = {
+  if (missing.length) throw new ConfigError("缺少环境变量: " + missing.join(", "));
+
+  return {
     endpoint: S3_ENDPOINT.replace(/\/+$/, ""),
     // 多数厂商会校验 region，缺失时用默认值兜底
     region: S3_REGION || "us-east-1",
@@ -235,9 +497,15 @@ function getS3Config(env) {
     accessKeyId: S3_ACCESS_KEY_ID,
     secretAccessKey: S3_SECRET_ACCESS_KEY,
     pathStyle: (env.S3_PATH_STYLE || "path") !== "virtual",
-    timeout: Number(env.S3_FETCH_TIMEOUT) || 15000,
+    timeout: normalizeTimeout(env.S3_FETCH_TIMEOUT),
   };
-  return s3ConfigCache;
+}
+
+/** 超时兜底并限制在 1s~60s，避免误配成 0 或超大值 */
+function normalizeTimeout(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return 15000;
+  return Math.min(Math.max(n, 1000), 60000);
 }
 
 /**
@@ -259,16 +527,43 @@ function buildObjectUrl(cfg, key) {
 }
 
 /**
- * 以 AWS Signature V4 签名方式 GET 对象。
+ * 回源请求，网络错误与 5xx 自动重试一次。
+ * 404/403 等确定性错误不重试，交给调用方区分 404 与 502。
+ */
+async function fetchFromS3(env, key, { method = "GET", range = null } = {}) {
+  const cfg = getS3Config(env);
+  const maxAttempts = 2;
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const res = await sendSignedRequest(cfg, key, method, range);
+
+      if (res.status >= 500 && attempt < maxAttempts) {
+        if (res.body) await res.body.cancel().catch(() => {});
+        lastError = new OriginError(res.status);
+        continue;
+      }
+      return res;
+    } catch (err) {
+      lastError = err;
+      if (attempt >= maxAttempts) break;
+    }
+  }
+
+  throw lastError || new Error("回源失败");
+}
+
+/**
+ * 以 AWS Signature V4 签名方式请求对象。
  * 纯原生实现，Workers 运行时无需任何依赖。
  */
-async function fetchFromS3(env, key) {
-  const cfg = getS3Config(env);
+async function sendSignedRequest(cfg, key, method, range) {
   const targetUrl = buildObjectUrl(cfg, key);
 
   const now = new Date();
   const amzDate = now.toISOString().replace(/[:-]|\.\d{3}/g, ""); // 20260101T000000Z
-  const dateStamp = amzDate.slice(0, 8);                          // 20260101
+  const dateStamp = amzDate.slice(0, 8); // 20260101
 
   const u = new URL(targetUrl);
   const canonicalUri = u.pathname;
@@ -282,12 +577,11 @@ async function fetchFromS3(env, key) {
   };
 
   const signedHeaderNames = Object.keys(headersToSign).sort();
-  const canonicalHeaders =
-    signedHeaderNames.map((n) => `${n}:${headersToSign[n]}\n`).join("");
+  const canonicalHeaders = signedHeaderNames.map((n) => `${n}:${headersToSign[n]}\n`).join("");
   const signedHeaders = signedHeaderNames.join(";");
 
   const canonicalRequest = [
-    "GET",
+    method,
     canonicalUri,
     canonicalQuery,
     canonicalHeaders,
@@ -304,10 +598,7 @@ async function fetchFromS3(env, key) {
   ].join("\n");
 
   const signingKey = await hmac(
-    await hmac(
-      await hmac(await hmac("AWS4" + cfg.secretAccessKey, dateStamp), cfg.region),
-      "s3"
-    ),
+    await hmac(await hmac(await hmac("AWS4" + cfg.secretAccessKey, dateStamp), cfg.region), "s3"),
     "aws4_request"
   );
   const signature = bytesToHex(await hmac(signingKey, stringToSign));
@@ -316,17 +607,18 @@ async function fetchFromS3(env, key) {
     `AWS4-HMAC-SHA256 Credential=${cfg.accessKeyId}/${credentialScope}, ` +
     `SignedHeaders=${signedHeaders}, Signature=${signature}`;
 
-  const res = await fetch(targetUrl, {
-    method: "GET",
-    headers: { ...headersToSign, Authorization: authorization },
+  const headers = { ...headersToSign, Authorization: authorization };
+  // Range 不参与签名：S3 兼容实现允许未签名的 Range 头
+  if (range) headers.Range = range;
+
+  return fetch(targetUrl, {
+    method,
+    headers,
     signal: AbortSignal.timeout(cfg.timeout),
   });
-
-  if (!res.ok) {
-    throw new Error(`对象存储返回 ${res.status}`);
-  }
-  return res;
 }
+
+/* ---------------- 镜像入库与 404 兜底 ---------------- */
 
 /**
  * 将源站响应流式写入 R2，不携带任何上游元数据。
@@ -338,20 +630,25 @@ async function fetchFromS3(env, key) {
  * 返回可直接用于响应的对象句柄，结构对齐 R2Object。
  */
 async function mirrorToR2(env, key, originResponse) {
-  // tee 出两条独立分支，两边可同时消费
   const [toR2, toClient] = originResponse.body.tee();
+  const size = parseSize(originResponse.headers.get("Content-Length"));
+  const fallback = { body: toClient, size, writeHttpMetadata() {} };
 
-  // 不写入任何上游元数据：源站的 Content-Disposition、Content-Type 均不采纳，
-  // 类型统一由响应侧 resolveContentType() 按后缀推断
-  const result = await env.R2_BUCKET.put(key, toR2);
+  try {
+    const result = await env.R2_BUCKET.put(key, toR2);
+    return { ...fallback, httpEtag: result && result.httpEtag };
+  } catch (err) {
+    // 落盘失败不影响本次响应：客户端照常拿到内容，下次请求再回源
+    console.error("[r2-proxy] 写入 R2 失败:", err);
+    // tee 的另一支由客户端消费；这里不能 await，否则可能一直等另一支结束
+    if (toR2) toR2.cancel().catch(() => {});
+    return fallback;
+  }
+}
 
-  // 最小 R2Object 替身，供上层统一走 writeHttpMetadata + body 的读取路径。
-  // 元数据为空，writeHttpMetadata 不写入任何头，类型由后缀推断决定。
-  return {
-    body: toClient,
-    httpEtag: result.httpEtag,
-    writeHttpMetadata() {},
-  };
+function parseSize(value) {
+  const n = Number(value);
+  return Number.isFinite(n) && n >= 0 ? n : undefined;
 }
 
 /** 404 兜底页：读取 R2 中的 404.html（无则从对象存储拉一次），以 404 状态码返回其内容 */
@@ -361,20 +658,25 @@ async function notFoundResponse(env) {
   // R2 里没有 404.html → 从对象存储镜像一份
   if (!object) {
     try {
-      const originResponse = await fetchFromS3(env, "404.html");
-      object = await mirrorToR2(env, "404.html", originResponse);
+      const originRes = await fetchFromS3(env, "404.html");
+      if (!originRes.ok) {
+        if (originRes.body) await originRes.body.cancel().catch(() => {});
+        return plainResponse(404, "Not Found");
+      }
+      object = await mirrorToR2(env, "404.html", originRes);
     } catch (err) {
       // 彻底没有 → 返回纯文本兜底
-      return new Response("Not Found", { status: 404, headers: corsHeaders() });
+      return plainResponse(404, "Not Found");
     }
   }
 
   const headers = new Headers();
-  object.writeHttpMetadata(headers);
-  headers.set("etag", object.httpEtag);
+  if (typeof object.writeHttpMetadata === "function") object.writeHttpMetadata(headers);
+  if (object.httpEtag) headers.set("ETag", object.httpEtag);
   headers.set("Content-Type", "text/html; charset=utf-8");
   headers.set("Content-Disposition", "inline");
   headers.set("Cache-Control", "no-store"); // 404 不进缓存
+  headers.set("X-Content-Type-Options", "nosniff");
   applyCors(headers);
 
   return new Response(object.body, { status: 404, headers });
